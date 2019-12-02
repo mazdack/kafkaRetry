@@ -45,12 +45,15 @@ class KafkaDifferentDxoApplication {
         return factory
     }
 }
-data class Request(val id: String, val requestMessage: String)
+data class Request(val id: String, val requestMessage: String, var requested: Int = 0)
 data class InventoryDataRequest(val id: Int, val message: String, var request: Request? = null)
 data class DiscountTransfer(val id: Int, val discount: Int, var request: Request? = null)
 interface RequestInterface {
     @JsonPath("$.request")
     fun getRequest(): Request
+
+    @JsonPath("$")
+    fun getRoot(): MutableMap<Any, Any>
 }
 
 @Service
@@ -72,10 +75,21 @@ class MySender(val kafkaTemplate: KafkaTemplate<String, Any>) {
 }
 
 @Component
-class MyListener() {
+class MyListener(val kafkaTemplate: KafkaTemplate<String, Any>) {
     @KafkaListener(groupId = "method", topics = [TOPIC], containerFactory = "myKafkaListenerContainerFactory")
     fun listen(data: RequestInterface) {
-        println(">>> in listen method ${data.getRequest()}")
+        val request = data.getRequest()
+        val root = data.getRoot()
+
+        request.requested++
+        root["request"] = request
+
+        println(">>> in listen method root was $root")
+        println(">>> in listen method request was $request")
+
+        if (request.requested < 5) {
+            kafkaTemplate.send(TOPIC, root)
+        }
     }
 }
 
