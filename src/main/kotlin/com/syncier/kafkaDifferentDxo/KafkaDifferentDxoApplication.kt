@@ -27,8 +27,10 @@ import java.time.temporal.ChronoUnit
 import kotlin.random.Random
 
 
-const val TOPIC = "allDxo"
+const val INVENTORY_TOPIC = "inventory"
+const val DISCOUNT_TOPIC = "discount"
 const val RETRY_TOPIC = "retry"
+const val DEAD_TOPIC = "dead"
 const val RETRY_TIMEOUT_SEC = 5L
 
 var lastProcessedId = 0
@@ -38,10 +40,16 @@ var lastProcessedId = 0
 @EnableKafka
 class KafkaDifferentDxoApplication {
     @Bean
-    fun topic() = TopicBuilder.name(TOPIC).build()
+    fun inventoryTopic() = TopicBuilder.name(INVENTORY_TOPIC).build()
+
+    @Bean
+    fun discountTopic() = TopicBuilder.name(DISCOUNT_TOPIC).build()
 
     @Bean
     fun retryTopic() = TopicBuilder.name(RETRY_TOPIC).build()
+
+    @Bean
+    fun deadTopic() = TopicBuilder.name(DEAD_TOPIC).build()
 
     @Bean
     fun retryingErrorHandler(kafkaTemplate: KafkaTemplate<String, Any>): ErrorHandler {
@@ -66,10 +74,39 @@ class KafkaDifferentDxoApplication {
     }
 
     @Bean
+    fun deadLetterErrorHandler(kafkaTemplate: KafkaTemplate<String, Any>): ErrorHandler {
+        return object: ErrorHandler {
+            override fun handle(thrownException: Exception, data: ConsumerRecord<*, *>) {
+                println("handling exception ${thrownException.message} for ${data.value()}")
+
+                val message = MessageBuilder
+                    .withPayload(data.value())
+                    .setHeader(KafkaHeaders.TOPIC, DEAD_TOPIC)
+                    .setHeader(KafkaHeaders.REPLY_TOPIC, data.headers().lastHeader(KafkaHeaders.REPLY_TOPIC))
+                    .build()
+
+                kafkaTemplate.send(message)
+            }
+
+            override fun isAckAfterHandle() = true
+        }
+    }
+
+    @Bean
     fun retryingKafkaListenerContainerFactory(kafkaProperties: KafkaProperties, consumerFactory: ConsumerFactory<Any, Any>, retryingErrorHandler: ErrorHandler): ConcurrentKafkaListenerContainerFactory<Any, Any> {
         val factory = ConcurrentKafkaListenerContainerFactory<Any, Any>()
         factory.consumerFactory = consumerFactory
         factory.setErrorHandler(retryingErrorHandler)
+        return factory
+    }
+
+    @Bean
+    fun retryKafkaListenerContainerFactory(kafkaProperties: KafkaProperties, consumerFactory: ConsumerFactory<Any, Any>, deadLetterErrorHandler: ErrorHandler,
+                                           kafkaTemplate: KafkaTemplate<String, Any>): ConcurrentKafkaListenerContainerFactory<Any, Any> {
+        val factory = ConcurrentKafkaListenerContainerFactory<Any, Any>()
+        factory.consumerFactory = consumerFactory
+        factory.setErrorHandler(deadLetterErrorHandler)
+        factory.setReplyTemplate(kafkaTemplate)
         return factory
     }
 }
@@ -102,10 +139,10 @@ class MySender(val kafkaTemplate: KafkaTemplate<String, Any>, var id: Int = 1) {
     @Scheduled(fixedRate = 1_000)
     fun cmd() {
         val inventoryDataRequest = InventoryDataRequest(id++, "hello world @${now()}", Request("requestId${id}"))
-        kafkaTemplate.send(TOPIC, inventoryDataRequest)
+        kafkaTemplate.send(INVENTORY_TOPIC, inventoryDataRequest)
 
         val discountTransfer = DiscountTransfer(id++, Random.nextInt(10, 100), Request("requestId${id}"))
-        kafkaTemplate.send(TOPIC, discountTransfer)
+        kafkaTemplate.send(DISCOUNT_TOPIC, discountTransfer)
 
         println(">> sent id $id, last processed id = $lastProcessedId")
     }
@@ -113,7 +150,7 @@ class MySender(val kafkaTemplate: KafkaTemplate<String, Any>, var id: Int = 1) {
 
 @Component
 class MyListener(val kafkaTemplate: KafkaTemplate<String, Any>) {
-    @KafkaListener(groupId = "method", topics = [RETRY_TOPIC], containerFactory = "kafkaListenerContainerFactory")
+    @KafkaListener(groupId = "method", topics = [RETRY_TOPIC], containerFactory="retryKafkaListenerContainerFactory")
     @SendTo
     fun listen(data: RetryableRequest): RetryableRequest? {
         println(">>retry listener started for $data")
@@ -131,12 +168,16 @@ class MyListener(val kafkaTemplate: KafkaTemplate<String, Any>) {
         }
 
         println(">>retry listener retries exhausted $data")
-        return null
+        throw RetriesExhausted()
     }
 }
 
+class RetriesExhausted : Throwable() {
+
+}
+
 @Component
-@KafkaListener(topics = [TOPIC], groupId = "class", containerFactory="retryingKafkaListenerContainerFactory")
+@KafkaListener(topics = [INVENTORY_TOPIC, DISCOUNT_TOPIC], groupId = "class", containerFactory="retryingKafkaListenerContainerFactory")
 class MaKafkaListener {
     @KafkaHandler
     fun receiveInvData(data: InventoryDataRequest) {
