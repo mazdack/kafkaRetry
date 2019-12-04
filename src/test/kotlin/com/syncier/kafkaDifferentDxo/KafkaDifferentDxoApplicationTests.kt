@@ -66,10 +66,11 @@ class KafkaDifferentDxoApplicationTests {
         await().atMost(1, TimeUnit.SECONDS).untilAsserted {
             deadConsumer.seekToBeginning(listOf(TopicPartition(DEAD_TOPIC, 0)))
             val records = KafkaTestUtils.getRecords(deadConsumer)
-            assertThat(records.count()).isEqualTo(1)
-            val firstRecordValue = records.records(DEAD_TOPIC).first().value()
-            val inventoryDataRequest = objectMapper.readValue(firstRecordValue, InventoryDataRequest::class.java)
-            assertThat(inventoryDataRequest.request!!.requested).isEqualTo(MAX_RETRIES+1)
+            val retriedRecordFromDeadTopic = records.records(DEAD_TOPIC).find {
+                val inventoryDataRequest = objectMapper.readValue(it.value(), InventoryDataRequest::class.java)
+                inventoryDataRequest.request!!.requested == MAX_RETRIES + 1
+            }
+            assertThat(retriedRecordFromDeadTopic).isNotNull()
         }
     }
 

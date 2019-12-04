@@ -2,7 +2,6 @@ package com.syncier.kafkaDifferentDxo
 
 import com.fasterxml.jackson.annotation.JsonFormat
 import org.apache.kafka.clients.consumer.ConsumerRecord
-import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.SpringBootApplication
