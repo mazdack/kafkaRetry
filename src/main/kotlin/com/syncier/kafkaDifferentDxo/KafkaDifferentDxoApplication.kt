@@ -2,10 +2,15 @@ package com.syncier.kafkaDifferentDxo
 
 import com.fasterxml.jackson.annotation.JsonFormat
 import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.SpringBootApplication
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.boot.autoconfigure.kafka.KafkaProperties
 import org.springframework.boot.runApplication
 import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
 import org.springframework.kafka.annotation.EnableKafka
 import org.springframework.kafka.annotation.KafkaHandler
 import org.springframework.kafka.annotation.KafkaListener
@@ -21,9 +26,11 @@ import org.springframework.scheduling.annotation.EnableScheduling
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
+import java.time.Duration
 import java.time.LocalDateTime
 import java.time.LocalDateTime.now
 import java.time.temporal.ChronoUnit
+import java.time.temporal.TemporalAmount
 import kotlin.random.Random
 
 
@@ -31,12 +38,11 @@ const val INVENTORY_TOPIC = "inventory"
 const val DISCOUNT_TOPIC = "discount"
 const val RETRY_TOPIC = "retry"
 const val DEAD_TOPIC = "dead"
-const val RETRY_TIMEOUT_SEC = 5L
+const val MAX_RETRIES = 5
 
 var lastProcessedId = 0
 
 @SpringBootApplication
-@EnableScheduling
 @EnableKafka
 class KafkaDifferentDxoApplication {
     @Bean
@@ -52,13 +58,14 @@ class KafkaDifferentDxoApplication {
     fun deadTopic() = TopicBuilder.name(DEAD_TOPIC).build()
 
     @Bean
-    fun retryingErrorHandler(kafkaTemplate: KafkaTemplate<String, Any>): ErrorHandler {
+    fun retryingErrorHandler(kafkaTemplate: KafkaTemplate<String, Any>, @Value("\${app.spring.retry.timeout}") retryTimeout: Duration): ErrorHandler {
         return object: ErrorHandler {
-            override fun handle(thrownException: Exception, data: ConsumerRecord<*, *>?) {
-                println("handling exception ${thrownException.cause!!.message} for ${data?.value()}")
+            override fun handle(thrownException: Exception, data: ConsumerRecord<*, *>) {
+                val logger = LoggerFactory.getLogger("retryingErrorHandler")
+                logger.info("handling exception ${thrownException.cause?.message} for ${data.value()}")
 
-                val request = data!!.value() as RetryableRequest
-                request.incrementTimeout()
+                val request = data.value() as RetryableRequest
+                request.incrementTimeout(retryTimeout)
 
                 val message = MessageBuilder
                     .withPayload(request)
@@ -77,7 +84,8 @@ class KafkaDifferentDxoApplication {
     fun deadLetterErrorHandler(kafkaTemplate: KafkaTemplate<String, Any>): ErrorHandler {
         return object: ErrorHandler {
             override fun handle(thrownException: Exception, data: ConsumerRecord<*, *>) {
-                println("handling exception ${thrownException.message} for ${data.value()}")
+                val logger = LoggerFactory.getLogger("deadLetterErrorHandler")
+                logger.info("handling exception ${thrownException.cause?.message} for ${data.value()}")
 
                 val message = MessageBuilder
                     .withPayload(data.value())
@@ -86,6 +94,8 @@ class KafkaDifferentDxoApplication {
                     .build()
 
                 kafkaTemplate.send(message)
+
+                logger.info("sent ${data.value()} to $DEAD_TOPIC topic")
             }
 
             override fun isAckAfterHandle() = true
@@ -112,7 +122,7 @@ class KafkaDifferentDxoApplication {
 }
 
 interface RetryableRequest {
-    fun incrementTimeout()
+    fun incrementTimeout(delta: TemporalAmount)
     fun incrementRetries()
 
     fun retryAt(): LocalDateTime
@@ -120,8 +130,8 @@ interface RetryableRequest {
 }
 
 data class Request(val id: String, var requested: Int = 1, @JsonFormat(shape = JsonFormat.Shape.STRING) var retryAt: LocalDateTime = now()): RetryableRequest {
-    override fun incrementTimeout() {
-        retryAt.plusSeconds(RETRY_TIMEOUT_SEC)
+    override fun incrementTimeout(delta: TemporalAmount) {
+        retryAt = retryAt.plus(delta)
     }
 
     override fun incrementRetries() {
@@ -133,6 +143,15 @@ data class Request(val id: String, var requested: Int = 1, @JsonFormat(shape = J
 }
 data class InventoryDataRequest(val id: Int, val message: String, var request: Request? = null): RetryableRequest by request!!
 data class DiscountTransfer(val id: Int, val discount: Int, var request: Request? = null): RetryableRequest by request!!
+
+
+@ConditionalOnProperty(
+ value = ["app.scheduling.enable"], havingValue = "true", matchIfMissing = true
+)
+@Configuration
+@EnableScheduling
+class SchedulingConfiguration {
+}
 
 @Service
 class MySender(val kafkaTemplate: KafkaTemplate<String, Any>, var id: Int = 1) {
@@ -162,7 +181,7 @@ class MyListener(val kafkaTemplate: KafkaTemplate<String, Any>) {
 //        println(">>retry listener will sleep until ${data.retryAt()}")
         data.incrementRetries()
 
-        if (data.retries() < 5) {
+        if (data.retries() <= MAX_RETRIES) {
             println(">>retry listener will retry $data")
             return data
         }
@@ -172,29 +191,38 @@ class MyListener(val kafkaTemplate: KafkaTemplate<String, Any>) {
     }
 }
 
-class RetriesExhausted : Throwable() {
+class RetriesExhausted : Throwable()
 
-}
-
-@Component
-@KafkaListener(topics = [INVENTORY_TOPIC, DISCOUNT_TOPIC], groupId = "class", containerFactory="retryingKafkaListenerContainerFactory")
-class MaKafkaListener {
-    @KafkaHandler
-    fun receiveInvData(data: InventoryDataRequest) {
+@Service
+class MyService {
+    fun doWork1(inventoryDataRequest: InventoryDataRequest) {
         if (Random.nextBoolean()) {
             throw RuntimeException("oops")
         }
-        println(">>>in inv data handler $data")
-        lastProcessedId = data.id
+        println(">>>in inv data handler $inventoryDataRequest")
+        lastProcessedId = inventoryDataRequest.id
     }
 
-    @KafkaHandler
-    fun receiveDiscount(discount: DiscountTransfer) {
+    fun doWork(discount: DiscountTransfer) {
         if (Random.nextBoolean()) {
             throw RuntimeException("oops")
         }
         println(">>>in discount: $discount")
         lastProcessedId = discount.id
+    }
+}
+
+@Component
+@KafkaListener(topics = [INVENTORY_TOPIC, DISCOUNT_TOPIC], groupId = "class", containerFactory="retryingKafkaListenerContainerFactory")
+class MaKafkaListener(val myService: MyService) {
+    @KafkaHandler
+    fun receiveInvData(data: InventoryDataRequest) {
+        myService.doWork1(data)
+    }
+
+    @KafkaHandler
+    fun receiveDiscount(discount: DiscountTransfer) {
+        myService.doWork(discount)
     }
 }
 

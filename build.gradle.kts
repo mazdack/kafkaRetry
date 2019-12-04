@@ -28,6 +28,8 @@ dependencies {
 		exclude(group = "org.junit.vintage", module = "junit-vintage-engine")
 	}
 	testImplementation("org.springframework.kafka:spring-kafka-test")
+    testImplementation("com.nhaarman.mockitokotlin2:mockito-kotlin:2.1.0")
+    testImplementation("org.awaitility:awaitility:3.1.6")
 }
 
 tasks.withType<Test> {
